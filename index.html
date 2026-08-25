@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Meowd</title>
+<style>
+  :root {
+    --bg: #15111a;
+    --accent: #ff6f91;
+    --mint: #7fe7c4;
+    --border: #2f2738;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; background: var(--bg);
+  }
+  body {
+    display: flex; align-items: center; justify-content: center;
+    padding: 16px; gap: 14px; flex-wrap: wrap;
+  }
+  /* Phone-call style tile: portrait aspect regardless of the source
+     camera's real orientation — object-fit: cover crops to fit, same
+     as how real video-call apps frame a landscape webcam into a
+     portrait tile. */
+  .frame {
+    position: relative; border-radius: 20px; overflow: hidden;
+    aspect-ratio: 9 / 16; background: #0d0a11;
+    width: clamp(180px, 42vw, 340px);
+    height: min(80vh, calc(clamp(180px, 42vw, 340px) * 16 / 9));
+    border: 1px solid var(--border);
+  }
+  video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); display: block; }
+  .frame.cat img { width: 100%; height: 100%; object-fit: cover; animation: catPop 0.35s cubic-bezier(0.2, 0.9, 0.3, 1.3); }
+  @keyframes catPop {
+    0%   { opacity: 0; transform: scale(0.85); }
+    60%  { opacity: 1; transform: scale(1.04); }
+    100% { opacity: 1; transform: scale(1); }
+  }
+  .controls {
+    position: absolute; bottom: 12px; right: 12px; z-index: 3;
+    display: flex; gap: 8px;
+  }
+  .icon-btn {
+    width: 40px; height: 40px; border-radius: 50%; border: 1px solid var(--border);
+    background: rgba(13,10,17,0.65); color: var(--mint); font-size: 17px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; backdrop-filter: blur(4px);
+  }
+  .icon-btn:hover { border-color: var(--mint); }
+</style>
+</head>
+<body>
+
+<div class="frame" id="camWrap">
+  <video id="video" autoplay playsinline muted></video>
+  <div class="controls">
+    <button class="icon-btn" id="startBtn" title="Start camera">📷</button>
+    <button class="icon-btn" id="soundToggle" title="Toggle sound">🔊</button>
+  </div>
+</div>
+
+<div class="frame cat" id="catBox"></div>
+
+<script type="module">
+import {
+  FilesetResolver, FaceLandmarker, HandLandmarker
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const video = document.getElementById('video');
+const startBtn = document.getElementById('startBtn');
+const soundToggle = document.getElementById('soundToggle');
+const catBox = document.getElementById('catBox');
+
+let soundEnabled = true;
+let audioCtx = null;
+
+// Small synthesized "blip" per reaction — no audio files needed, so no
+// licensing to worry about. Pitch varies a bit per gesture for character.
+const BLIP_FREQ = {
+  shy_fingers: 520, shush: 460, shocked_wave: 720, fistbump: 300,
+  laugh_point: 660, pointup: 560, wink: 780, smirk: 500, blank: 400
+};
+
+function playBlip(key) {
+  if (!soundEnabled) return;
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const freq = BLIP_FREQ[key] || 500;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+  osc.frequency.exponentialRampToValueAtTime(freq * 1.4, audioCtx.currentTime + 0.09);
+  gain.gain.setValueAtTime(0.16, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.16);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + 0.16);
+}
+
+soundToggle.addEventListener('click', () => {
+  soundEnabled = !soundEnabled;
+  soundToggle.textContent = soundEnabled ? '🔊' : '🔇';
+});
+
+const CAT_LABELS = {
+  shy_fingers:   { file: 'assets/cat_shy_fingers.jpg',      label: 'Shy fingers' },
+  shush:         { file: 'assets/cat_shush.jpg',             label: 'Shush' },
+  shocked_wave:  { file: 'assets/cat_shocked_wave.jpg',      label: 'Shaka!' },
+  fistbump:      { file: 'assets/cat_fistbump.jpg',          label: 'Fist bump' },
+  laugh_point:   { file: 'assets/cat_laugh_point.jpg',       label: 'Laughing point' },
+  pointup:       { file: 'assets/cat_pointup_glasses.jpg',   label: 'Point up' },
+  wink:          { file: 'assets/cat_wink.jpg',              label: 'Wink' },
+  smirk:         { file: 'assets/cat_smirk.jpg',             label: 'Smirk' },
+  blank:         { file: 'assets/cat_blank.jpg',             label: 'Neutral' }
+};
+
+let faceLandmarker, handLandmarker;
+
+let shyGraceFrames = 0;
+const SHY_GRACE = 18; // ~0.3-0.5s of held memory to survive detection flicker
+let lastVideoTime = -1;
+let history = [];
+const HISTORY_LEN = 6;
+let currentShown = null;
+
+async function createLandmarkers(vision) {
+  // Not every mobile browser supports the GPU (WebGL) delegate reliably —
+  // fall back to CPU automatically so this still works on more devices.
+  async function tryDelegate(delegate) {
+    const face = await FaceLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+        delegate
+      },
+      outputFaceBlendshapes: true,
+      runningMode: "VIDEO",
+      numFaces: 1
+    });
+    const hand = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate
+      },
+      runningMode: "VIDEO",
+      numHands: 2,
+      minHandDetectionConfidence: 0.3,
+      minHandPresenceConfidence: 0.3,
+      minTrackingConfidence: 0.3
+    });
+    return { face, hand };
+  }
+
+  try {
+    return await tryDelegate("GPU");
+  } catch (err) {
+    console.warn('GPU delegate failed, falling back to CPU:', err.message);
+    return await tryDelegate("CPU");
+  }
+}
+
+async function init() {
+  try {
+    console.log('loading models…');
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+    const { face, hand } = await createLandmarkers(vision);
+    faceLandmarker = face;
+    handLandmarker = hand;
+    console.log('models ready');
+  } catch (err) {
+    console.error('model load error:', err);
+  }
+}
+init();
+
+startBtn.addEventListener('click', async () => {
+  try {
+    console.log('requesting camera…');
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user' }, audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    startBtn.style.display = 'none';
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    requestAnimationFrame(loop);
+    console.log('tracking');
+  } catch (err) {
+    console.error('camera error:', err);
+  }
+});
+
+function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+
+function angleAt(a, b, c) {
+  const v1x = a.x - b.x, v1y = a.y - b.y;
+  const v2x = c.x - b.x, v2y = c.y - b.y;
+  const m1 = Math.hypot(v1x, v1y), m2 = Math.hypot(v2x, v2y);
+  if (m1 < 1e-6 || m2 < 1e-6) return 180;
+  const cos = Math.min(1, Math.max(-1, (v1x * v2x + v1y * v2y) / (m1 * m2)));
+  return Math.acos(cos) * 180 / Math.PI;
+}
+
+// Finger is "extended" if its joints are roughly straight (~180deg),
+// "curled" if bent sharply — this holds regardless of hand rotation/tilt,
+// unlike a plain distance-from-wrist check.
+function fingerExtended(lm, mcp, pip, tip, threshold = 145) {
+  return angleAt(lm[mcp], lm[pip], lm[tip]) > threshold;
+}
+
+function handShape(lm) {
+  return {
+    thumb:  angleAt(lm[2], lm[3], lm[4]) > 150,
+    index:  fingerExtended(lm, 5, 6, 8),
+    middle: fingerExtended(lm, 9, 10, 12),
+    ring:   fingerExtended(lm, 13, 14, 16),
+    pinky:  fingerExtended(lm, 17, 18, 20)
+  };
+}
+
+function isShaka(s)   { return s.thumb && s.pinky && !s.index && !s.middle && !s.ring; }
+function isFist(s)    { return !s.index && !s.middle && !s.ring && !s.pinky; }
+function isPointing(s){ return s.index && !s.middle && !s.ring && !s.pinky; }
+
+function isShyFingers(hands) {
+  if (hands.length !== 2) return false;
+  const s0 = handShape(hands[0]), s1 = handShape(hands[1]);
+  return s0.index && s1.index && dist(hands[0][8], hands[1][8]) < 0.22;
+}
+
+function getScore(categories, name) {
+  const c = categories.find(c => c.categoryName === name);
+  return c ? c.score : 0;
+}
+
+function classify(faceCats, faceLm, hands) {
+
+  if (faceLm) {
+    const mouthCenter = {
+      x: (faceLm[13].x + faceLm[14].x) / 2,
+      y: (faceLm[13].y + faceLm[14].y) / 2
+    };
+    for (const lm of hands) {
+      const s = handShape(lm);
+      if (isPointing(s) && dist(lm[8], mouthCenter) < 0.09) return 'shush';
+    }
+  }
+
+  for (const lm of hands) {
+    const s = handShape(lm);
+    if (isShaka(s)) return 'shocked_wave';
+    if (isFist(s)) return 'fistbump';
+  }
+
+  const jawOpen = getScore(faceCats, 'jawOpen');
+  const smileL = getScore(faceCats, 'mouthSmileLeft');
+  const smileR = getScore(faceCats, 'mouthSmileRight');
+  const smile = (smileL + smileR) / 2;
+  const blinkL = getScore(faceCats, 'eyeBlinkLeft');
+  const blinkR = getScore(faceCats, 'eyeBlinkRight');
+
+  for (const lm of hands) {
+    const s = handShape(lm);
+    if (isPointing(s)) {
+      return (jawOpen > 0.22 || smile > 0.3) ? 'laugh_point' : 'pointup';
+    }
+  }
+
+  if (Math.abs(blinkL - blinkR) > 0.28 && Math.max(blinkL, blinkR) > 0.4) return 'wink';
+
+  const smileDiff = Math.abs(smileL - smileR);
+  if (smileDiff > 0.25 && jawOpen < 0.25) return 'smirk';
+
+  return 'blank';
+}
+
+function loop() {
+  if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const now = performance.now();
+    const faceResult = faceLandmarker.detectForVideo(video, now);
+    const handResult = handLandmarker.detectForVideo(video, now);
+
+    const faceCats = faceResult.faceBlendshapes && faceResult.faceBlendshapes[0]
+      ? faceResult.faceBlendshapes[0].categories : [];
+    const faceLm = faceResult.faceLandmarks && faceResult.faceLandmarks[0]
+      ? faceResult.faceLandmarks[0] : null;
+    const hands = handResult.landmarks || [];
+
+    const key = isShyFingers(hands)
+      ? (shyGraceFrames = SHY_GRACE, 'shy_fingers')
+      : (shyGraceFrames > 0
+          ? (shyGraceFrames--, 'shy_fingers')
+          : classify(faceCats, faceLm, hands));
+    history.push(key);
+    if (history.length > HISTORY_LEN) history.shift();
+    const counts = {};
+    for (const k of history) counts[k] = (counts[k] || 0) + 1;
+    const stable = Object.keys(counts).reduce((a, b) => counts[a] >= counts[b] ? a : b);
+
+    if (stable !== currentShown) {
+      currentShown = stable;
+      const cat = CAT_LABELS[stable];
+      catBox.innerHTML = `<img src="${cat.file}" alt="${cat.label}">`;
+      playBlip(stable);
+
+      // Diagnostics go to the console now — open dev tools if you need to tune thresholds.
+      console.log(
+        `key: ${key} (shown: ${stable}) | hands: ${hands.length} | jawOpen: ${getScore(faceCats,'jawOpen').toFixed(2)} ` +
+        `smileL/R: ${getScore(faceCats,'mouthSmileLeft').toFixed(2)}/${getScore(faceCats,'mouthSmileRight').toFixed(2)} ` +
+        `blinkL/R: ${getScore(faceCats,'eyeBlinkLeft').toFixed(2)}/${getScore(faceCats,'eyeBlinkRight').toFixed(2)}`
+      );
+    }
+  }
+  requestAnimationFrame(loop);
+}
+</script>
+
+</body>
+</html>
