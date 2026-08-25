@@ -31,7 +31,7 @@
     border: 1px solid var(--border);
   }
   video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); display: block; }
-  .frame.cat img { width: 100%; height: 100%; object-fit: cover; animation: catPop 0.35s cubic-bezier(0.2, 0.9, 0.3, 1.3); }
+  .frame.cat img { width: 100%; height: 100%; object-fit: contain; animation: catPop 0.35s cubic-bezier(0.2, 0.9, 0.3, 1.3); }
   @keyframes catPop {
     0%   { opacity: 0; transform: scale(0.85); }
     60%  { opacity: 1; transform: scale(1.04); }
